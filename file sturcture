@@ -1,3 +1,0 @@
-kerala_news_sentiment/
-├── app.py             ← main Streamlit app
-├── requirements.txt   ← dependencies
