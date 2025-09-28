@@ -1,155 +1,422 @@
-
 import os
 import time
+import json
+import threading
+import queue
 import requests
-import pandas as pd
 import streamlit as st
-import joblib
-from datetime import datetime
 
-# -----------------------------
-# Streamlit page setup
-# -----------------------------
-st.set_page_config(page_title="Live News Sentiment (NewsAPI)", page_icon="📰", layout="wide")
+from datetime import datetime, timezone
+from typing import List, Dict
 
-# -----------------------------
-# Model loading
-# -----------------------------
-@st.cache_resource
-def load_model():
-    path = os.getenv("SK_MODEL_PATH", "news_sentiment_sklearn.pkl")
-    return joblib.load(path)
+# Spark
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType, IntegerType
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import RegexTokenizer, StopWordsRemover, HashingTF, IDF, StringIndexer
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
 
-model = load_model()
+######################################################################
+# Configuration
+######################################################################
 
-# -----------------------------
-# NewsAPI helpers
-# -----------------------------
-NEWS_API_KEY = os.getenv("NEWSAPI_API_KEY") or st.secrets.get("NEWSAPI_API_KEY", None)
+# Choose API provider: "newsapi" or "newsdata"
+API_MODE = os.getenv("API_MODE", "newsapi")  # newsapi | newsdata
+NEWSAPI_KEY = os.getenv("f6a082e3499c4779942ea3f429151fe3", "")
+# Query terms for headlines
+QUERY = os.getenv("QUERY", "technology")
+LANG = os.getenv("LANG", "en")
 
-BASE_TOP = "https://newsapi.org/v2/top-headlines"         # country/category/pageSize/page [web:76]
-BASE_EVERYTHING = "https://newsapi.org/v2/everything"      # q/searchIn/sources/pageSize/sortBy/page [web:85]
+# Streaming mode: "memory_queue" or "kafka"
+STREAM_MODE = os.getenv("STREAM_MODE", "memory_queue")  # memory_queue | kafka
 
-HEADERS = {"X-Api-Key": NEWS_API_KEY} if NEWS_API_KEY else {}
+# Kafka parameters (if STREAM_MODE == "kafka")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "news-headlines")
 
-def fetch_top_headlines(country="us", category=None, page_size=20, page=1):
+# Streamlit refresh seconds
+DASHBOARD_REFRESH_SECS = int(os.getenv("DASHBOARD_REFRESH_SECS", "3"))
+
+######################################################################
+# Helper: News API fetchers
+######################################################################
+
+def fetch_news_newsapi(query: str, lang: str, page_size: int = 50) -> List[Dict]:
+    """
+    Uses NewsAPI.org /v2/everything to fetch recent articles.
+    Requires NEWSAPI_KEY in env. Docs: https://newsapi.org/docs [web:2][web:20]
+    """
+    if not NEWSAPI_KEY:
+        return []
+    url = "https://newsapi.org/v2/everything"
     params = {
-        "country": country,              # 2-letter ISO code; cannot combine with sources [web:76]
-        "pageSize": min(int(page_size), 100),  # max 100 [web:76]
-        "page": max(int(page), 1),
+        "q": query,
+        "language": lang,
+        "pageSize": page_size,
+        "sortBy": "publishedAt",
+        "apiKey": NEWSAPI_KEY,
     }
-    if category:
-        params["category"] = category    # business/entertainment/general/health/science/sports/technology [web:76]
-    r = requests.get(BASE_TOP, params=params, headers=HEADERS, timeout=15)
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
-    articles = data.get("articles", [])
-    rows = []
-    for a in articles:
-        rows.append({
-            "title": (a.get("title") or "").strip(),
-            "description": (a.get("description") or "").strip(),
-            "source": ((a.get("source") or {}).get("name") or "").strip(),
+    arts = data.get("articles", [])
+    out = []
+    for a in arts:
+        out.append({
+            "title": a.get("title") or "",
+            "description": a.get("description") or "",
+            "source": (a.get("source") or {}).get("name") or "",
             "url": a.get("url") or "",
-            "published_at": a.get("publishedAt") or "",
+            "publishedAt": a.get("publishedAt") or datetime.now(timezone.utc).isoformat()
         })
-    total = data.get("totalResults", len(rows))
-    return pd.DataFrame(rows), total
+    return out
 
-def fetch_everything(q, page_size=20, page=1, language="en", search_in=None, sort_by="publishedAt"):
-    # q supports advanced operators, must be URL-encoded by requests; searchIn can be title,description,content [web:85]
+def fetch_news_newsdata(query: str, lang: str, size: int = 50) -> List[Dict]:
+    """
+    Uses NewsData.io /api/1/news to fetch recent articles.
+    Requires NEWSDATA_API_KEY in env. Docs: https://newsdata.io [web:17]
+    """
+    if not NEWSDATA_API_KEY:
+        return []
+    url = "https://newsdata.io/api/1/news"
     params = {
-        "q": q,
-        "language": language,
-        "pageSize": min(int(page_size), 100),  # max 100 [web:85]
-        "page": max(int(page), 1),
-        "sortBy": sort_by,                    # relevancy, popularity, publishedAt [web:85]
+        "apikey": NEWSDATA_API_KEY,
+        "q": query,
+        "language": lang,
+        "page": 1
     }
-    if search_in:
-        params["searchIn"] = ",".join(search_in)  # e.g., ["title","description"] [web:85]
-    r = requests.get(BASE_EVERYTHING, params=params, headers=HEADERS, timeout=15)
+    r = requests.get(url, params=params, timeout=15)
     r.raise_for_status()
     data = r.json()
-    articles = data.get("articles", [])
-    rows = []
-    for a in articles:
-        rows.append({
-            "title": (a.get("title") or "").strip(),
-            "description": (a.get("description") or "").strip(),
-            "source": ((a.get("source") or {}).get("name") or "").strip(),
-            "url": a.get("url") or "",
-            "published_at": a.get("publishedAt") or "",
+    results = data.get("results", []) or []
+    out = []
+    for a in results[:size]:
+        out.append({
+            "title": a.get("title") or "",
+            "description": a.get("description") or "",
+            "source": a.get("source_id") or "",
+            "url": a.get("link") or "",
+            "publishedAt": a.get("pubDate") or datetime.now(timezone.utc).isoformat()
         })
-    total = data.get("totalResults", len(rows))
-    return pd.DataFrame(rows), total
+    return out
 
-def classify_titles(df):
-    if df.empty:
-        return df
-    preds = model.predict(df["title"].fillna("").tolist())
-    df["sentiment"] = ["Positive" if int(p) == 1 else "Negative" for p in preds]
-    df["timestamp"] = datetime.utcnow().isoformat()
+def fetch_headlines(query: str, lang: str) -> List[Dict]:
+    """
+    Wrapper to fetch headlines based on API_MODE.
+    """
+    if API_MODE == "newsdata":
+        return fetch_news_newsdata(query, lang)
+    # default to newsapi
+    return fetch_news_newsapi(query, lang)
+
+######################################################################
+# Producer Thread: Poll API and enqueue messages
+######################################################################
+
+class HeadlineProducer(threading.Thread):
+    def __init__(self, q: queue.Queue, poll_interval: int = 10):
+        super().__init__(daemon=True)
+        self.q = q
+        self.poll_interval = poll_interval
+        self.seen = set()
+
+    def run(self):
+        while True:
+            try:
+                articles = fetch_headlines(QUERY, LANG)
+                for art in articles:
+                    key = (art.get("title") or "").strip()
+                    if key and key not in self.seen:
+                        self.seen.add(key)
+                        payload = {
+                            "title": art["title"],
+                            "description": art["description"],
+                            "source": art["source"],
+                            "url": art["url"],
+                            "publishedAt": art["publishedAt"],
+                            "ingestedAt": datetime.utcnow().isoformat()
+                        }
+                        self.q.put(payload)
+                time.sleep(self.poll_interval)
+            except Exception:
+                time.sleep(self.poll_interval)
+
+######################################################################
+# Spark Setup
+######################################################################
+
+def create_spark():
+    """
+    Create SparkSession with Kafka support if needed, per Spark + Kafka integration guide. [web:12]
+    """
+    builder = (
+        SparkSession.builder
+        .appName("RealTimeNewsSentiment")
+        .config("spark.sql.streaming.schemaInference", "true")
+    )
+    # For local dev, enable single JVM
+    builder = builder.master("local[*]")
+    spark = builder.getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
+
+######################################################################
+# Build a simple Sentiment Pipeline
+######################################################################
+
+def build_sentiment_pipeline():
+    """
+    Basic text -> tokens -> remove stopwords -> TF -> IDF -> LogisticRegression.
+    Referencing common PySpark pipeline patterns for text classification. [web:7][web:16][web:13][web:10]
+    """
+    tokenizer = RegexTokenizer(inputCol="text", outputCol="tokens", pattern="\\W+")
+    remover = StopWordsRemover(inputCol="tokens", outputCol="filtered")
+    tf = HashingTF(inputCol="filtered", outputCol="rawFeatures", numFeatures=1 << 18)
+    idf = IDF(inputCol="rawFeatures", outputCol="features")
+    # Label indexer expects string labels
+    label_indexer = StringIndexer(inputCol="label_str", outputCol="label", handleInvalid="keep")
+    lr = LogisticRegression(featuresCol="features", labelCol="label", maxIter=50)
+    pipe = Pipeline(stages=[tokenizer, remover, tf, idf, label_indexer, lr])
+    return pipe
+
+def seed_training_data(spark):
+    """
+    Tiny seed dataset for demonstration; replace with a proper labeled corpus for accuracy. [web:7][web:19]
+    """
+    samples = [
+        ("Stocks rally to record highs after upbeat earnings", "Positive"),
+        ("Company shares plunge amid revenue miss and layoffs", "Negative"),
+        ("New product launch delights customers and boosts outlook", "Positive"),
+        ("Regulatory probe triggers uncertainty for major bank", "Negative"),
+        ("Tech giant posts stronger-than-expected profits", "Positive"),
+        ("Supply chain disruptions hurt quarterly performance", "Negative"),
+        ("Innovative partnership accelerates growth plans", "Positive"),
+        ("Data breach exposes user information", "Negative"),
+    ]
+    df = spark.createDataFrame(samples, schema=["text", "label_str"])
     return df
 
-# -----------------------------
-# UI
-# -----------------------------
-st.title("📰 Live News Sentiment (NewsAPI + TF‑IDF LR)")
-
-if not NEWS_API_KEY:
-    st.warning("Set NEWSAPI_API_KEY in environment or Streamlit secrets to enable live fetching. See NewsAPI docs for parameters and limits.")
-    st.stop()
-
-with st.sidebar:
-    st.header("Fetch Options")
-    mode = st.radio("Mode", ["Top Headlines", "Everything"])
-    page_size = st.slider("Articles per call", 5, 100, 20, 5)  # NewsAPI max 100 [web:76][web:85]
-    page = st.number_input("Page", min_value=1, value=1, step=1)
-
-    if mode == "Top Headlines":
-        country = st.selectbox("Country", ["us","in","gb","au","ca","de","fr","it","sg","za"], index=0)
-        category = st.selectbox("Category", ["", "business","entertainment","general","health","science","sports","technology"], index=0)
-    else:
-        q = st.text_input("Query (supports advanced operators)", value="technology")  # quotes, +must, -not, AND/OR/NOT [web:85]
-        language = st.selectbox("Language", ["en","de","fr","es","it","pt","ru","zh","ar"], index=0)
-        search_in = st.multiselect("Search in fields", ["title","description","content"], default=["title","description"])
-        sort_by = st.selectbox("Sort by", ["publishedAt","relevancy","popularity"], index=0)
-
-    do_fetch = st.button("Fetch Live News")
-
-# Fetch and classify
-if do_fetch:
+def train_or_load_model(spark):
+    train_df = seed_training_data(spark)
+    pipe = build_sentiment_pipeline()
+    model = pipe.fit(train_df)
+    # Simple eval on training just to get a metric
+    pred = model.transform(train_df)
+    evaluator = BinaryClassificationEvaluator(rawPredictionCol="rawPrediction", labelCol="label", metricName="areaUnderROC")
     try:
-        if mode == "Top Headlines":
-            df, total = fetch_top_headlines(country=country, category=(category or None), page_size=page_size, page=page)
+        auc = evaluator.evaluate(pred)
+        print(f"Seed AUC (train): {auc:.3f}")
+    except Exception:
+        pass
+    return model
+
+######################################################################
+# Streaming: Memory queue source
+######################################################################
+
+def start_memory_queue_stream(spark, model, shared_table_name="news_predictions"):
+    """
+    Use a Python queue as source; micro-batch in a thread pushes rows to a Spark MemoryStream.
+    We implement via foreachBatch on a static micro-batch created periodically. [web:12][web:15]
+    """
+    # Define schema for incoming records
+    schema = StructType([
+        StructField("title", StringType(), True),
+        StructField("description", StringType(), True),
+        StructField("source", StringType(), True),
+        StructField("url", StringType(), True),
+        StructField("publishedAt", StringType(), True),
+        StructField("ingestedAt", StringType(), True)
+    ])
+
+    # Create rate source to trigger batches and use a thread-safe accumulator list for new items
+    # Simpler: we poll a global queue each trigger, convert to DataFrame, union, then transform
+
+    news_q = GLOBAL_NEWS_QUEUE
+
+    def process_batch(_time, batch_df):
+        # Drain queue
+        items = []
+        try:
+            while True:
+                items.append(news_q.get_nowait())
+        except queue.Empty:
+            pass
+
+        if not items:
+            return
+
+        src_df = spark.createDataFrame(items, schema=schema)
+        # Prepare text field for model
+        df_prep = src_df.withColumn("text", F.coalesce(F.col("title"), F.lit("")))
+        pred_df = model.transform(df_prep)
+        out = (
+            pred_df.select(
+                "title", "source", "url",
+                F.col("probability").alias("prob"),
+                F.col("prediction").cast(IntegerType()).alias("prediction"),
+                F.col("publishedAt").alias("published_at"),
+                F.col("ingestedAt").alias("ingested_at")
+            )
+        )
+        # Write to in-memory table for Streamlit
+        out.write.format("memory").mode("append").saveAsTable(shared_table_name)
+
+    # Dummy stream to trigger foreachBatch regularly
+    rate_df = spark.readStream.format("rate").option("rowsPerSecond", 1).load()
+    query = (
+        rate_df.writeStream
+        .outputMode("update")
+        .foreachBatch(process_batch)
+        .option("checkpointLocation", "./chk_memory_queue")
+        .start()
+    )
+    return query
+
+######################################################################
+# Streaming: Kafka source (optional)
+######################################################################
+
+def start_kafka_stream(spark, model, shared_table_name="news_predictions"):
+    """
+    Read from Kafka topic and predict. Requires Spark Kafka integration and running Kafka. [web:12][web:6][web:18]
+    """
+    raw = (
+        spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("subscribe", KAFKA_TOPIC)
+        .option("startingOffsets", "latest")
+        .load()
+    )
+
+    # Expect JSON messages with same fields as producer
+    val_str = raw.selectExpr("CAST(value AS STRING) as json")
+    schema = StructType([
+        StructField("title", StringType(), True),
+        StructField("description", StringType(), True),
+        StructField("source", StringType(), True),
+        StructField("url", StringType(), True),
+        StructField("publishedAt", StringType(), True),
+        StructField("ingestedAt", StringType(), True)
+    ])
+
+    parsed = val_str.select(F.from_json(F.col("json"), schema).alias("obj")).select("obj.*")
+    df_prep = parsed.withColumn("text", F.coalesce(F.col("title"), F.lit("")))
+    pred_df = model.transform(df_prep)
+    out = (
+        pred_df.select(
+            "title", "source", "url",
+            F.col("probability").alias("prob"),
+            F.col("prediction").cast(IntegerType()).alias("prediction"),
+            F.col("publishedAt").alias("published_at"),
+            F.col("ingestedAt").alias("ingested_at")
+        )
+    )
+
+    # Write to in-memory table for Streamlit
+    query = (
+        out.writeStream
+        .format("memory")
+        .queryName("pred_sink")
+        .outputMode("append")
+        .option("checkpointLocation", "./chk_kafka")
+        .start()
+    )
+    return query
+
+######################################################################
+# Streamlit UI
+######################################################################
+
+def render_dashboard(spark, shared_table_name="news_predictions"):
+    st.set_page_config(page_title="Real-Time News Sentiment", layout="wide")
+    st.title("Real-Time News Sentiment")
+
+    with st.sidebar:
+        st.markdown(f"API: {API_MODE.upper()} | Query: {QUERY} | Lang: {LANG}")
+        st.markdown(f"Stream: {STREAM_MODE}")
+        st.markdown("Prediction: 1=Positive, 0=Negative")
+        st.markdown("Auto-refresh enabled")
+
+    # Auto-refresh
+    st_autorefresh = st.empty()
+
+    cols = st.columns([2, 1])
+    with cols[0]:
+        st.subheader("Latest Predictions")
+        # Read from in-memory table
+        try:
+            df = spark.sql(f"SELECT *, CASE WHEN prediction=1 THEN 'Positive' ELSE 'Negative' END as sentiment FROM {shared_table_name} ORDER BY ingested_at DESC LIMIT 50")
+            pdf = df.toPandas()
+        except Exception:
+            pdf = None
+
+        if pdf is not None and not pdf.empty:
+            pdf_view = pdf[["sentiment", "title", "source", "url", "published_at", "ingested_at"]]
+            st.dataframe(pdf_view, use_container_width=True)
         else:
-            df, total = fetch_everything(q=q, page_size=page_size, page=page, language=language, search_in=search_in, sort_by=sort_by)
+            st.info("Waiting for predictions...")
 
-        df = classify_titles(df)
+    with cols[1]:
+        st.subheader("Counts (last 200)")
+        try:
+            agg = spark.sql(f"""
+                SELECT
+                    CASE WHEN prediction=1 THEN 'Positive' ELSE 'Negative' END as sentiment,
+                    COUNT(*) as cnt
+                FROM {shared_table_name}
+                ORDER BY ingested_at DESC
+                LIMIT 200
+            """)
+            agg_pdf = agg.groupBy("sentiment").agg(F.sum("cnt").alias("cnt")).toPandas()
+        except Exception:
+            agg_pdf = None
 
-        st.success(f"Fetched {len(df)} of ~{total} results (page {page}).")
-        pos = (df["sentiment"] == "Positive").sum()
-        neg = (df["sentiment"] == "Negative").sum()
+        if agg_pdf is not None and not agg_pdf.empty:
+            st.bar_chart(agg_pdf.set_index("sentiment"))
+        else:
+            st.info("No counts yet.")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total", len(df))
-        c2.metric("Positive", pos)
-        c3.metric("Negative", neg)
+    time.sleep(DASHBOARD_REFRESH_SECS)
+    st_autorefresh.write("")
 
-        # Filters
-        with st.expander("Filters"):
-            sel_sent = st.multiselect("Sentiment", options=["Positive","Negative"], default=["Positive","Negative"])
-            sel_src = st.multiselect("Source", options=sorted(df["source"].dropna().unique().tolist()), default=None)
-        fdf = df[df["sentiment"].isin(sel_sent)]
-        if sel_src:
-            fdf = fdf[fdf["source"].isin(sel_src)]
+######################################################################
+# Main Orchestration
+######################################################################
 
-        st.dataframe(fdf[["title","sentiment","source","published_at","url"]], use_container_width=True)
+GLOBAL_NEWS_QUEUE = queue.Queue()
 
-        # Pagination hint (manual paging per NewsAPI docs)
-        st.caption("Use the Page control in sidebar to navigate more results. NewsAPI returns up to pageSize per page, with max pageSize=100.")
+def main():
+    # Start producer thread for memory_queue mode
+    if STREAM_MODE == "memory_queue":
+        producer = HeadlineProducer(GLOBAL_NEWS_QUEUE, poll_interval=10)
+        producer.start()
 
-    except requests.HTTPError as e:
-        st.error(f"HTTP error: {e}")
-    except Exception as e:
-        st.error(f"Error: {e}")
+    spark = create_spark()
+    model = train_or_load_model(spark)
+
+    shared_table_name = "news_predictions"
+
+    if STREAM_MODE == "kafka":
+        # To use Kafka in prod, publish fetched headlines with an external Kafka producer,
+        # then enable this stream. Spark Kafka guide: spark.apache.org docs. [web:12][web:6][web:15]
+        query = start_kafka_stream(spark, model, shared_table_name=shared_table_name)
+    else:
+        query = start_memory_queue_stream(spark, model, shared_table_name=shared_table_name)
+
+    # Streamlit dashboard loop
+    # Streamlit runs script top-to-bottom; use a simple loop guarded by session_state
+    if "started" not in st.session_state:
+        st.session_state["started"] = True
+
+    # Render UI repeatedly; Streamlit reruns on interaction, so just render once
+    render_dashboard(spark, shared_table_name=shared_table_name)
+
+    # Keep query alive (Streamlit process typically lives)
+    if query.isActive:
+        pass
+
+if __name__ == "__main__":
+    main()
