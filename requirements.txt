@@ -1,17 +1,5 @@
-# Core app
-streamlit==1.37.0
-requests>=2.31.0,<3
-
-# Spark (choose one of these pins based on Python version on the host)
-# Streamlit Community Cloud currently supports Python up to 3.11; PySpark 3.5.x supports 3.8–3.11. [web:41][web:52][web:46]
-pyspark==3.5.2
-
-# Optional: Kafka integration for Spark Structured Streaming
-# To use Spark + Kafka, you must add the spark-sql-kafka package at runtime via
-# Spark config or provide the appropriate wheel/jar; pip package below brings connector shims,
-# but brokers must be reachable from the host. You can omit this if using memory_queue mode. [web:39][web:41]
-# kafka-python>=2.0.2
-
-# Optional: Data handling niceties
-pandas>=2.0,<3
-pyarrow>=14,<17
+streamlit
+requests
+pyspark
+pandas
+pyarrow
