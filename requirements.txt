@@ -1,4 +1,4 @@
 streamlit
-textblob
-requests
-matplotlib
+scikit-learn
+pandas
+joblib
